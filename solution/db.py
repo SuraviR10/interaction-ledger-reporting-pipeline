@@ -50,12 +50,14 @@ CREATE TABLE IF NOT EXISTS interaction_ledger (
     event_type TEXT NOT NULL,
     workflow_id TEXT NOT NULL,
     call_id TEXT NOT NULL,
-    occurred_at_utc TEXT NOT NULL,
-    occurred_at_ist TEXT NOT NULL,
+    occurred_at_raw TEXT DEFAULT '' NOT NULL,
+    occurred_at_utc TEXT DEFAULT NULL,
+    occurred_at_ist TEXT DEFAULT NULL,
     lead_id INTEGER REFERENCES leads(lead_id),
     phone_hash TEXT,
+    phone_encrypted TEXT DEFAULT NULL,
     payload TEXT,
-    is_orphan INTEGER DEFAULT 0,
+    is_orphan INTEGER DEFAULT NULL,
     ingested_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -119,10 +121,94 @@ def get_db(db_path: Optional[Union[str, Path]] = None) -> Generator[sqlite3.Conn
         conn.close()
 
 
+def migrate_db(conn: sqlite3.Connection) -> None:
+    """
+    Safely migrates existing database tables created under previous schemas
+    without data loss.
+    - Upgrades interaction_ledger: adds occurred_at_raw, phone_encrypted,
+      makes occurred_at_utc/ist nullable, sets is_orphan default to NULL.
+    - Populates occurred_at_raw from existing occurred_at_utc.
+    - Preserves ledger_ids, foreign keys, indexes, and all existing data.
+    """
+    cursor = conn.execute("PRAGMA table_info(interaction_ledger);")
+    columns = {row["name"]: dict(row) for row in cursor.fetchall()}
+
+    # If table doesn't exist yet, nothing to migrate (SCHEMA_SQL creates it)
+    if not columns:
+        return
+
+    # Check if migration is needed
+    needs_migration = (
+        "occurred_at_raw" not in columns
+        or "phone_encrypted" not in columns
+        or columns.get("occurred_at_utc", {}).get("notnull") == 1
+        or columns.get("is_orphan", {}).get("dflt_value") == "0"
+    )
+
+    if not needs_migration:
+        return
+
+    # Determine expressions for copying data safely
+    has_raw = "occurred_at_raw" in columns
+    has_enc_phone = "phone_encrypted" in columns
+
+    raw_expr = "occurred_at_raw" if has_raw else "COALESCE(occurred_at_utc, occurred_at_ist, '')"
+    phone_expr = "phone_encrypted" if has_enc_phone else "NULL"
+
+    conn.execute("ALTER TABLE interaction_ledger RENAME TO _interaction_ledger_old;")
+
+    conn.execute(
+        """
+        CREATE TABLE interaction_ledger (
+            ledger_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_id TEXT NOT NULL UNIQUE,
+            event_type TEXT NOT NULL,
+            workflow_id TEXT NOT NULL,
+            call_id TEXT NOT NULL,
+            occurred_at_raw TEXT DEFAULT '' NOT NULL,
+            occurred_at_utc TEXT DEFAULT NULL,
+            occurred_at_ist TEXT DEFAULT NULL,
+            lead_id INTEGER REFERENCES leads(lead_id),
+            phone_hash TEXT,
+            phone_encrypted TEXT DEFAULT NULL,
+            payload TEXT,
+            is_orphan INTEGER DEFAULT NULL,
+            ingested_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        """
+    )
+
+    conn.execute(
+        f"""
+        INSERT INTO interaction_ledger (
+            ledger_id, event_id, event_type, workflow_id, call_id,
+            occurred_at_raw, occurred_at_utc, occurred_at_ist,
+            lead_id, phone_hash, phone_encrypted, payload,
+            is_orphan, ingested_at
+        )
+        SELECT
+            ledger_id, event_id, event_type, workflow_id, call_id,
+            {raw_expr}, occurred_at_utc, occurred_at_ist,
+            lead_id, phone_hash, {phone_expr}, payload,
+            is_orphan, ingested_at
+        FROM _interaction_ledger_old;
+        """
+    )
+
+    conn.execute("DROP TABLE _interaction_ledger_old;")
+
+    # Recreate indexes
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ledger_call_id ON interaction_ledger(call_id);")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ledger_lead_id ON interaction_ledger(lead_id);")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ledger_orphan ON interaction_ledger(workflow_id, phone_hash, is_orphan);")
+
+
 def init_db(db_path: Optional[Union[str, Path]] = None) -> None:
     """
-    Initializes the database schema if tables do not exist.
+    Initializes the database schema if tables do not exist, and safely migrates
+    legacy schema tables without data loss.
     This operation is safe to run multiple times (idempotent).
     """
     with get_db(db_path) as conn:
         conn.executescript(SCHEMA_SQL)
+        migrate_db(conn)

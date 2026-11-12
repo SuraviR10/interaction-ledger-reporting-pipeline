@@ -95,24 +95,38 @@ The lead ingestion engine processes dirty customer CSV uploads against per-workf
 
 ---
 
-## 5. Event Stream Reading & Parsing (Part 4, Checkpoint 4A)
+## 5. Event Stream Ingestion & Interaction Ledger (Part 4, Checkpoints 4A & 4B)
 
-The event ingestion module (`solution.event_ingestion`) provides streaming reading and structural validation of JSONL call event files:
+The event ingestion module (`solution.event_ingestion`) provides streaming reading, structural validation, and append-only database persistence for telephony event logs:
 - **Streaming Parser (`read_event_jsonl`)**: Processes event files line-by-line using standard library `json.loads`.
 - **Validation Rules (`parse_event_line`)**:
   - Validates that the parsed JSON is a dictionary (handles arrays, scalars, booleans, and null as malformed records without crashing).
   - Validates that required core fields (`event_id`, `event_type`, `workflow_id`, `call_id`, `occurred_at`) are present and non-empty.
   - Treats `phone` as optional (`disposition.override` events intentionally omit phone).
   - Preserves original raw `occurred_at` timestamp strings and payload structures without mutation.
-- **Counting & Statistics (`EventIngestionStats`)**:
-  - `events_total`: Counts every non-empty line read exactly once.
-  - `malformed_events`: Increments for invalid JSON syntax, non-dict payloads, or missing core fields.
+- **Append-Only Database Persistence (`ingest_event_jsonl`)**:
+  - Inserts new event records into `interaction_ledger` without ever updating or deleting existing records.
+  - Human supervisor overrides (`disposition.override`) are appended as new, distinct ledger entries, preserving the original `disposition.set` events.
+  - Linkage state is set to `is_orphan = NULL` (unprocessed linkage, distinguishing pending linkage from confirmed orphan status).
+- **PII Encryption at Rest**:
+  - Raw phone numbers from `phone_raw` are encrypted using Fernet (`phone_encrypted TEXT`) before insertion.
+  - Events lacking a phone store `NULL`. Plaintext phone numbers are never stored in columns or serialized in payloads.
+- **Deduplication & Narrow Integrity Handling**:
+  - Combines an initial fast-path `SELECT 1 FROM interaction_ledger WHERE event_id = ?` with a narrow `sqlite3.IntegrityError` handler on `INSERT`.
+  - Suppresses only confirmed unique constraint violations on `event_id`, incrementing `duplicate_events_dropped` without crashing. Unrelated database errors are immediately re-raised.
+  - Never uses `INSERT OR REPLACE` (which performs a destructive delete-and-insert).
+- **Idempotency & Atomic Transactions**:
+  - Entire files are processed inside an atomic database transaction. If a failure occurs, all inserted events and the batch record roll back together.
+  - Uses `ingestion_batches` to safely skip previously processed event files.
+- **Schema Migration (`solution.db.migrate_db`)**:
+  - Automatically upgrades databases created with previous schemas to add `occurred_at_raw` and `phone_encrypted`.
+  - Populates `occurred_at_raw` from `occurred_at_utc` on existing records and preserves ledger IDs, foreign keys, indexes, and existing data.
 
 ---
 
 ## 6. Running Tests
 
-Run all 43 unit tests using Python's standard `unittest` or `pytest`:
+Run all 52 unit tests using Python's standard `unittest` or `pytest`:
 ```powershell
 python -m unittest discover tests
 # or
@@ -128,8 +142,8 @@ python -m pytest -v
   - Part 2: PII authenticated encryption, deterministic HMAC phone hashing, key validation, environment loading.
   - Part 3: Lead CSV ingestion, header mapping, phone/date/decimal/enum normalisation, rejections audit, warnings, duplicate merging, idempotency.
   - Part 4 (Checkpoint 4A): JSONL event streaming reader, structural validation, malformed record detection, stats tracking (`events_total`, `malformed_events`).
-- **Current Limitations / Upcoming in Next Checkpoints:**
-  - Checkpoint 4B: Append-only interaction ledger database persistence, unique event ID deduplication.
+  - Part 4 (Checkpoint 4B): Database ledger storage, safe schema migration with legacy data preservation, PII phone encryption at rest, narrow duplicate event handling, file idempotency, and atomic transactions.
+- **Current Limitations / Upcoming in Next Checkpoint (4C):**
   - Checkpoint 4C: Lead phone linking, override call-based linking, orphan quarantine and retry, IST timestamp normalization, unknown disposition filtering.
   - Part 5: Business metrics & 5 output reports.
   - Part 6: CLI runner.

@@ -88,7 +88,7 @@ Good luck. We're looking forward to reading your work.
 - **Part 1 (Database Foundation):** Implemented clean SQLite connection management, schema initialization, and transactional safety in `solution/db.py`.
 - **Part 2 (PII Security & Encryption Foundation):** Implemented authenticated symmetric encryption and deterministic phone hashing in `solution/security.py`.
 - **Part 3 (Lead Ingestion & Normalisation Engine):** Implemented header alias matching, phone (+91 canonical), date, decimal, enum normalisation, rejection audits, warnings, duplicate merging (last-write-wins), and idempotency in `solution/lead_ingestion.py` and `solution/normalizers.py`.
-- **Part 4 (Checkpoint 4A - Event Reading & Parsing):** Implemented streaming JSONL parser, structural validation, malformed record detection, optional phone support, and metrics tracking in `solution/event_ingestion.py`.
+- **Part 4 (Checkpoint 4A & 4B - Event Reading, Validation, & Ledger Storage):** Implemented streaming JSONL parser, structural validation, safe schema migration with legacy preservation, encrypted phone storage at rest, narrow duplicate event suppression, file idempotency, and atomic append-only transactions in `solution/event_ingestion.py` and `solution/db.py`.
 
 ### Security & Key Management
 - **Encryption:** Fernet (AES-128-CBC + HMAC-SHA256 authenticated encryption) for fields marked `"pii": true` (`customer_name`, `phone`).
