@@ -510,3 +510,4 @@ def ingest_lead_directory(
         overall_stats.merge(file_stats)
 
     return overall_stats
+

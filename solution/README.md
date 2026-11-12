@@ -14,6 +14,7 @@ solution/
 ├── db.py                 # SQLite connection management and schema initialisation
 ├── normalizers.py        # Header, phone, date, decimal, and enum normalisation
 ├── lead_ingestion.py     # CSV parsing, schema validation, duplicate merging, and DB persistence
+├── event_ingestion.py    # JSONL event stream reading, parsing, and structural validation
 └── security.py           # Authenticated symmetric encryption (Fernet) and HMAC phone hashing
 ```
 
@@ -94,9 +95,24 @@ The lead ingestion engine processes dirty customer CSV uploads against per-workf
 
 ---
 
-## 5. Running Tests
+## 5. Event Stream Reading & Parsing (Part 4, Checkpoint 4A)
 
-Run all 35 unit tests using Python's standard `unittest` or `pytest`:
+The event ingestion module (`solution.event_ingestion`) provides streaming reading and structural validation of JSONL call event files:
+- **Streaming Parser (`read_event_jsonl`)**: Processes event files line-by-line using standard library `json.loads`.
+- **Validation Rules (`parse_event_line`)**:
+  - Validates that the parsed JSON is a dictionary (handles arrays, scalars, booleans, and null as malformed records without crashing).
+  - Validates that required core fields (`event_id`, `event_type`, `workflow_id`, `call_id`, `occurred_at`) are present and non-empty.
+  - Treats `phone` as optional (`disposition.override` events intentionally omit phone).
+  - Preserves original raw `occurred_at` timestamp strings and payload structures without mutation.
+- **Counting & Statistics (`EventIngestionStats`)**:
+  - `events_total`: Counts every non-empty line read exactly once.
+  - `malformed_events`: Increments for invalid JSON syntax, non-dict payloads, or missing core fields.
+
+---
+
+## 6. Running Tests
+
+Run all 43 unit tests using Python's standard `unittest` or `pytest`:
 ```powershell
 python -m unittest discover tests
 # or
@@ -105,13 +121,15 @@ python -m pytest -v
 
 ---
 
-## 6. Current Implementation Status & Limitations
+## 7. Current Implementation Status & Limitations
 
 - **Completed:**
   - Part 1: SQLite schema initialisation, connection management, transactions.
   - Part 2: PII authenticated encryption, deterministic HMAC phone hashing, key validation, environment loading.
   - Part 3: Lead CSV ingestion, header mapping, phone/date/decimal/enum normalisation, rejections audit, warnings, duplicate merging, idempotency.
-- **Current Limitations / Upcoming in Next Parts:**
-  - JSONL event ingestion & orphan resolution (Part 4).
-  - Business metrics & 5 output reports (Part 5).
-  - CLI runner (Part 6).
+  - Part 4 (Checkpoint 4A): JSONL event streaming reader, structural validation, malformed record detection, stats tracking (`events_total`, `malformed_events`).
+- **Current Limitations / Upcoming in Next Checkpoints:**
+  - Checkpoint 4B: Append-only interaction ledger database persistence, unique event ID deduplication.
+  - Checkpoint 4C: Lead phone linking, override call-based linking, orphan quarantine and retry, IST timestamp normalization, unknown disposition filtering.
+  - Part 5: Business metrics & 5 output reports.
+  - Part 6: CLI runner.
