@@ -9,9 +9,13 @@ Provides pure functions for:
 - Enum case-insensitive validation and lowercase storage
 """
 
-from datetime import datetime
+import csv
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 import re
 from typing import Any, Dict, List, Optional, Tuple
+
+IST = timezone(timedelta(hours=5, minutes=30))
 
 
 def normalize_header_name(header: str) -> str:
@@ -179,3 +183,61 @@ def normalize_enum(raw_value: Optional[str], allowed_values: List[str]) -> Tuple
         return lowered, True
 
     return None, False
+
+
+def parse_event_timestamp(raw_value: Optional[str]) -> Tuple[Optional[str], Optional[str], bool]:
+    """
+    Parses an event timestamp into normalized UTC and IST ISO strings.
+
+    Accepts:
+    - UTC ISO strings ending in 'Z' (e.g. '2026-10-05T13:20:21Z')
+    - Explicit timezone offset ISO strings (e.g. '2026-10-02T10:00:00+05:30')
+    - Naive timestamps (e.g. '2026-10-03 10:01:00'). Per spec: Naive means IST.
+
+    Returns:
+    - (occurred_at_utc, occurred_at_ist, is_valid)
+    - If invalid or unparseable: (None, None, False)
+    """
+    if not raw_value or not str(raw_value).strip():
+        return None, None, False
+
+    trimmed = str(raw_value).strip()
+    try:
+        # Standardize trailing 'Z' if present for compatibility across Python versions
+        iso_str = trimmed[:-1] + "+00:00" if trimmed.endswith("Z") else trimmed
+        dt = datetime.fromisoformat(iso_str)
+        if dt.tzinfo is None:
+            # Naive means IST (+05:30) per assignment specification
+            dt = dt.replace(tzinfo=IST)
+
+        utc_dt = dt.astimezone(timezone.utc)
+        ist_dt = dt.astimezone(IST)
+
+        utc_str = utc_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+        ist_str = ist_dt.strftime("%Y-%m-%dT%H:%M:%S+05:30")
+        return utc_str, ist_str, True
+    except Exception:
+        return None, None, False
+
+
+def load_disposition_catalogue(csv_path: Optional[Path] = None) -> Dict[Tuple[str, str], Tuple[bool, bool]]:
+    """
+    Loads the disposition catalogue from CSV.
+    Returns a dict mapping (workflow_id, code) -> (is_terminal, is_success).
+    """
+    from solution.config import SCHEMAS_DIR
+    target_path = csv_path or (SCHEMAS_DIR / "dispositions.csv")
+    catalogue: Dict[Tuple[str, str], Tuple[bool, bool]] = {}
+    if not target_path.is_file():
+        return catalogue
+
+    with open(target_path, "r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            wf = row["workflow_id"].strip()
+            code = row["code"].strip()
+            terminal = row["is_terminal"].strip().lower() == "true"
+            success = row["is_success"].strip().lower() == "true"
+            catalogue[(wf, code)] = (terminal, success)
+    return catalogue
+

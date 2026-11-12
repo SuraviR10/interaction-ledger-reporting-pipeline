@@ -21,6 +21,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from solution.config import SCHEMAS_DIR
 from solution.db import get_db
+from solution.event_ingestion import retry_orphan_linking
 from solution.normalizers import (
     match_header_to_field,
     normalize_date,
@@ -429,6 +430,9 @@ def ingest_lead_csv(
                                 json.dumps(incoming_extras) if incoming_extras else None,
                             ),
                         )
+
+        # Retry linking any pending or orphan events now that new leads are available
+        retry_orphan_linking(conn, enc_key=active_enc_key, hash_key=active_hash_key)
 
         # Record batch ingestion in tracking table
         conn.execute(
