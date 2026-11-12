@@ -19,6 +19,10 @@ CREATE TABLE IF NOT EXISTS ingestion_batches (
     batch_key TEXT PRIMARY KEY,
     drop_name TEXT NOT NULL,
     file_type TEXT NOT NULL,
+    total_rows INTEGER DEFAULT 0,
+    rejected_rows INTEGER DEFAULT 0,
+    duplicate_rows INTEGER DEFAULT 0,
+    warning_count INTEGER DEFAULT 0,
     ingested_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 

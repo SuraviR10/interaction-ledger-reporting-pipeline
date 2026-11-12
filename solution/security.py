@@ -109,3 +109,4 @@ def generate_encryption_key() -> str:
 def generate_hash_key() -> str:
     """Utility helper to generate a secure random 256-bit (32-byte) hex key for HMAC."""
     return secrets.token_hex(32)
+
