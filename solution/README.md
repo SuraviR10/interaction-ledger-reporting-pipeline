@@ -1,149 +1,139 @@
 # Solution: Interaction Ledger & Reporting Pipeline
 
-This directory contains the application code for **Assignment A: Interaction Ledger & Reporting Pipeline**.
+This directory contains the production-grade implementation of **Assignment A: Interaction Ledger & Reporting Pipeline**.
 
 ---
 
 ## 1. Architecture Overview
 
-The solution is organised into focused, testable modules:
+The pipeline is organized into modular, testable components with zero unnecessary external dependencies (uses standard library + `cryptography` + `pytest`):
+
 ```text
 solution/
 ├── __init__.py           # Package indicator
+├── __main__.py           # CLI entrypoint for `python -m solution`
+├── cli.py                # Command-line interface (`ingest`, `report`, `run`, `init-db`)
 ├── config.py             # Centralised path, timezone, and environment configuration
-├── db.py                 # SQLite connection management and schema initialisation
-├── normalizers.py        # Header, phone, date, decimal, and enum normalisation
-├── lead_ingestion.py     # CSV parsing, schema validation, duplicate merging, and DB persistence
-├── event_ingestion.py    # JSONL event stream reading, parsing, and structural validation
-└── security.py           # Authenticated symmetric encryption (Fernet) and HMAC phone hashing
+├── db.py                 # SQLite connection management, schema initialisation, WAL mode, migrations
+├── security.py           # Authenticated symmetric encryption (Fernet) and HMAC-SHA256 phone hashing
+├── normalizers.py        # Header, Indian phone (+91), multi-format dates, decimals, enums, timestamps
+├── lead_ingestion.py     # CSV parsing, schema validation order, duplicate merging, DB persistence
+├── event_ingestion.py    # JSONL event stream reader, deduplication, phone linking, orphan quarantine & retries
+├── outcomes.py           # Call metrics, effective disposition hierarchy, and lead bucket evaluation
+└── reports.py            # Business report generation (all 5 contract files)
 ```
 
 ---
 
-## 2. Database Foundation (Part 1)
+## 2. Completed Pipeline Stages
 
-Database operations use standard library `sqlite3` with strict integrity constraints:
-- **Foreign keys:** Explicitly enabled via `PRAGMA foreign_keys = ON;`.
-- **Concurrency:** Uses Write-Ahead Logging (`PRAGMA journal_mode = WAL;`) for disk-backed databases.
-- **Row access:** Uses `sqlite3.Row` for dictionary-like name-based column access.
-- **Transactions:** Handled via the `@contextmanager get_db(db_path)` helper, ensuring atomic commits and automatic rollbacks on error.
+### Stage 1: Database Foundation (`solution.db`)
+- SQLite connection management with foreign key enforcement (`PRAGMA foreign_keys = ON;`).
+- Write-Ahead Logging (`PRAGMA journal_mode = WAL;`) for disk-backed concurrency.
+- Dictionary-like row access via `sqlite3.Row`.
+- Atomic transactional commits and rollbacks via `@contextmanager get_db()`.
+- Safe schema migration (`migrate_db`) supporting upgrades from legacy schemas without data loss.
 
-### Database Tables:
-1. `ingestion_batches`: Tracks ingested files for drop-level idempotency and records row counts.
-2. `leads`: Stores cleaned leads with encrypted PII, masked phone suffix, and HMAC lookup hash.
-3. `interaction_ledger`: Append-only event log with orphan tracking and IST/UTC timestamps.
-4. `lead_rejections`: Audit table for invalid CSV rows (strictly no PII).
+### Stage 2: PII Security & Encryption Foundation (`solution.security`)
+- **Fernet Authenticated Encryption:** AES-128 in CBC mode with PKCS7 padding and HMAC-SHA256 authentication for sensitive fields (`customer_name`, `phone`).
+- **Deterministic HMAC-SHA256 Hashing:** Used for `(workflow_id, phone_hash)` lead identity and event matching without storing plaintext numbers.
+- **Environment Key Management:** Secrets loaded from `.env` via standard library parser; format-validated on access.
 
----
+### Stage 3: Lead CSV Ingestion & Normalisation (`solution.lead_ingestion`, `solution.normalizers`)
+- **Header Matching:** Trims, lowercases, collapses underscores/spaces to match schema `name` or `aliases`.
+- **Row Filtering & Numbering:** Blank rows skipped and not counted; row numbers start at 1.
+- **Field Normalisation:**
+  - Phone: Indian 10-digit mobile numbers canonicalized to `+91XXXXXXXXXX`.
+  - Date: Multi-format day-first dates (`YYYY-MM-DD`, `DD/MM/YYYY`, `DD-MM-YYYY`, `DD-Mon-YYYY`).
+  - Decimal: Strips currency symbols (`₹`, `Rs`, `INR`) and thousands commas; rounds to 2 places.
+  - Enum: Case-insensitive match against allowed schema values; stored lowercase.
+- **Validation Order & Rejection Audit:** Checked strictly in schema order. First failure recorded in `lead_rejections` (strictly without PII).
+- **Duplicate Merging:** Last-write-wins for non-null incoming fields while permanently retaining original `batch_id`.
+- **Defaults:** Applied to null fields after merging.
 
-## 3. PII Security & Encryption Foundation (Part 2)
+### Stage 4: Event Processing & Append-Only Interaction Ledger (`solution.event_ingestion`)
+- **Streaming Parser:** Line-by-line reading; malformed JSON and missing core fields tracked and skipped.
+- **Append-Only Invariant:** Records inserted into `interaction_ledger`; original event history is never overwritten or deleted.
+- **Deduplication:** Initial `SELECT` check combined with narrow `IntegrityError` suppression on `event_id`.
+- **Stage 4C1 – Lead Linking:** Decrypts phone in memory, canonicalizes, computes HMAC-SHA256, and links to `leads(lead_id)`. Plaintext phone is never logged or stored.
+- **Stage 4C2 – Orphan Handling & Retries:**
+  - Events that cannot currently link remain pending (`is_orphan = NULL`).
+  - Malformed phones are confirmed orphans (`is_orphan = 1`).
+  - `disposition.override` without phone links via `call_id` to other events in the same call.
+  - `retry_orphan_linking(conn)`: Retries pending/orphan events automatically when new leads arrive (e.g. Drop 2).
+- **Stage 4C3 – Timestamps & Dispositions:**
+  - Parses UTC (`Z`), offset (`+05:30`), and naive (interpreted as IST). Stores normalized `occurred_at_utc` and `occurred_at_ist`.
+  - Validates disposition codes against `dispositions.csv` per workflow. Unknown codes increment `unknown_disposition_events` and are ignored in effective disposition calculations.
 
-Per the assignment specification, sensitive customer data (`"pii": true` fields such as `customer_name` and `phone`) are never stored in plaintext.
+### Stage 5: Call Outcomes & Lead Buckets (`solution.outcomes`)
+- Calls counted only if linked `call.initiated` event is present. Call date is the IST date.
+- Connected calls identified via `call.connected`.
+- **Effective Disposition:** Latest valid `disposition.override` by timestamp; else latest valid `disposition.set`; deterministic tie-break using `ledger_id DESC`.
+- **Lead Buckets (Exact Priority Order):**
+  1. `yet_to_reach_out`: 0 calls.
+  2. `completed`: any call has a terminal disposition (`is_terminal = true`).
+  3. `in_progress_telephony_failed`: every call has a `call.telephony_failed` event.
+  4. `in_progress_dialed`: all other cases.
 
-### Security Mechanisms:
-1. **Fernet Authenticated Symmetric Encryption (`solution.security.encrypt_string` / `decrypt_string`)**:
-   - Used for `customer_name` and canonical `phone`.
-   - Built on AES-128 in CBC mode with PKCS7 padding and authenticated via HMAC-SHA256.
-   - Any ciphertext tampering or invalid key raises an `InvalidToken` error.
+### Stage 6: Business Report Generation (`solution.reports`)
+Generates all five required files matching the exact specification:
+1. `batch_summary.csv`: Aggregations per `workflow_id, batch_id`.
+2. `daily_overview.csv`: Metrics per `workflow_id, date` (`connectivity_rate` formatted to 4 decimals, `success_leads` distinct count).
+3. `lead_report.csv`: Per-lead metrics (`phone_masked` as `+91******` + last 4, `last_call_at` in ISO-8601 IST, lowercase booleans).
+4. `rejections.csv`: Rejection audit log (strictly no PII).
+5. `data_quality.json`: Final consolidated pipeline health metrics.
 
-2. **Deterministic Phone Hashing (`solution.security.hash_phone`)**:
-   - Used for lead identity `(workflow_id, phone_hash)`, deduplication, and event-to-lead linking.
-   - Built using **HMAC-SHA256** with a secret key.
-   - Prevents rainbow table and dictionary attacks against the small search space of Indian mobile numbers.
-
----
-
-## 4. Lead CSV Ingestion & Normalisation (Part 3)
-
-The lead ingestion engine processes dirty customer CSV uploads against per-workflow JSON schemas.
-
-### Ingestion Workflow & Rules:
-
-1. **File Discovery & Workflow Mapping (`discover_lead_csv_files`, `identify_workflow`)**:
-   - Reads CSV files in sorted filename order (`batch_001.csv`, `batch_002.csv`, ...).
-   - Identifies workflow by directory convention (`leads/<workflow_id>/<batch_id>.csv`) or header inspection fallback.
-   - Uses the file stem (e.g. `batch_001`) as the permanent `batch_id`.
-
-2. **Header Normalisation (`solution.normalizers.normalize_header_name`, `match_header_to_field`)**:
-   - Converts headers to lowercase, strips whitespace, and collapses runs of underscores/whitespace into single spaces.
-   - Matches against schema `name` or `aliases`.
-   - Unknown headers are ignored.
-
-3. **Row Filtering & Numbering**:
-   - Completely blank rows (all cells empty or whitespace) are skipped and not counted.
-   - Data row numbers count non-blank rows starting at 1. The header row is not counted.
-   - Values are trimmed; empty strings are treated as missing (`None`).
-
-4. **Data Normalisation (`solution.normalizers`)**:
-   - **Phone:** Strips non-digits, strips leading `91` (if 12 digits) or `0` (if 11 digits), validates 10 digits starting with 6/7/8/9. Canonical format: `+91XXXXXXXXXX`.
-   - **Date:** Accepts `YYYY-MM-DD`, `DD/MM/YYYY`, `DD-MM-YYYY`, `DD-Mon-YYYY` (day-first). Rejects impossible dates (e.g. 31/02/2026).
-   - **Decimal:** Strips `₹`, `Rs`, `Rs.`, `INR`, commas. Must be $\ge 0$. Rounds to 2 decimal places.
-   - **Enum:** Case-insensitive match against allowed schema values; stored in lowercase.
-
-5. **Validation, Rejections & Warnings**:
-   - Validated strictly in schema field order.
-   - Missing required field $\rightarrow$ `missing_required:<field_name>`.
-   - Present phone number invalid $\rightarrow$ `invalid_phone`.
-   - First failure becomes the row's single rejection reason. Rejected rows are recorded in `lead_rejections` (strictly without PII) and excluded from `leads`.
-   - Optional invalid fields become `None` and increment the `field_warnings` counter. Warnings are only counted for valid (non-rejected) rows.
-
-6. **Duplicate Merging (Last Write Wins)**:
-   - Unique lead identity is `(workflow_id, canonical phone)` identified by `(workflow_id, phone_hash)`.
-   - The first valid occurrence creates the lead record and permanently assigns its `batch_id`.
-   - Later valid occurrences increment `duplicate_lead_rows_merged` and overwrite only fields where the incoming value is non-null (*last write wins*).
-   - Schema defaults (e.g. `preferred_language = "en"`) apply after merging to fields that remain null.
+### Stage 7: CLI & End-to-End Execution (`solution.cli`)
+- `python -m solution ingest <drop_path>`: Ingests lead CSVs, event JSONLs, and runs orphan resolution.
+- `python -m solution report --out <out_dir>`: Generates all five reports.
+- `python -m solution run <drop_paths...> --out <out_dir>`: Multi-drop sequential ingestion and reporting.
+- `python -m solution init-db`: Schema initialization and verification.
 
 ---
 
-## 5. Event Stream Ingestion & Interaction Ledger (Part 4, Checkpoints 4A & 4B)
+## 3. How to Run
 
-The event ingestion module (`solution.event_ingestion`) provides streaming reading, structural validation, and append-only database persistence for telephony event logs:
-- **Streaming Parser (`read_event_jsonl`)**: Processes event files line-by-line using standard library `json.loads`.
-- **Validation Rules (`parse_event_line`)**:
-  - Validates that the parsed JSON is a dictionary (handles arrays, scalars, booleans, and null as malformed records without crashing).
-  - Validates that required core fields (`event_id`, `event_type`, `workflow_id`, `call_id`, `occurred_at`) are present and non-empty.
-  - Treats `phone` as optional (`disposition.override` events intentionally omit phone).
-  - Preserves original raw `occurred_at` timestamp strings and payload structures without mutation.
-- **Append-Only Database Persistence (`ingest_event_jsonl`)**:
-  - Inserts new event records into `interaction_ledger` without ever updating or deleting existing records.
-  - Human supervisor overrides (`disposition.override`) are appended as new, distinct ledger entries, preserving the original `disposition.set` events.
-  - Linkage state is set to `is_orphan = NULL` (unprocessed linkage, distinguishing pending linkage from confirmed orphan status).
-- **PII Encryption at Rest**:
-  - Raw phone numbers from `phone_raw` are encrypted using Fernet (`phone_encrypted TEXT`) before insertion.
-  - Events lacking a phone store `NULL`. Plaintext phone numbers are never stored in columns or serialized in payloads.
-- **Deduplication & Narrow Integrity Handling**:
-  - Combines an initial fast-path `SELECT 1 FROM interaction_ledger WHERE event_id = ?` with a narrow `sqlite3.IntegrityError` handler on `INSERT`.
-  - Suppresses only confirmed unique constraint violations on `event_id`, incrementing `duplicate_events_dropped` without crashing. Unrelated database errors are immediately re-raised.
-  - Never uses `INSERT OR REPLACE` (which performs a destructive delete-and-insert).
-- **Idempotency & Atomic Transactions**:
-  - Entire files are processed inside an atomic database transaction. If a failure occurs, all inserted events and the batch record roll back together.
-  - Uses `ingestion_batches` to safely skip previously processed event files.
-- **Schema Migration (`solution.db.migrate_db`)**:
-  - Automatically upgrades databases created with previous schemas to add `occurred_at_raw` and `phone_encrypted`.
-  - Populates `occurred_at_raw` from `occurred_at_utc` on existing records and preserves ledger IDs, foreign keys, indexes, and existing data.
+### Setup Environment
+```bash
+# 1. Activate virtual environment
+source .venv/bin/activate  # On Windows: .venv\Scripts\Activate.ps1
+
+# 2. Configure environment keys (see .env.example)
+cp .env.example .env
+# Ensure PII_ENCRYPTION_KEY and PHONE_HASH_KEY are set
+```
+
+### Ingestion and Reporting Commands
+```bash
+# Ingest Drop 1
+python -m solution ingest data/drop_1
+
+# Ingest Drop 2 (incrementally resolves delayed orphans)
+python -m solution ingest data/drop_2
+
+# Generate Reports
+python -m solution report --out reports/
+
+# Or run complete multi-drop pipeline in one step
+python -m solution run data/drop_1 data/drop_2 --out reports/
+```
 
 ---
 
-## 6. Running Tests
+## 4. Test Suite
 
-Run all 52 unit tests using Python's standard `unittest` or `pytest`:
-```powershell
-python -m unittest discover tests
-# or
+The solution includes 73 automated unit and integration tests across 9 test suites:
+```bash
 python -m pytest -v
 ```
 
----
-
-## 7. Current Implementation Status & Limitations
-
-- **Completed:**
-  - Part 1: SQLite schema initialisation, connection management, transactions.
-  - Part 2: PII authenticated encryption, deterministic HMAC phone hashing, key validation, environment loading.
-  - Part 3: Lead CSV ingestion, header mapping, phone/date/decimal/enum normalisation, rejections audit, warnings, duplicate merging, idempotency.
-  - Part 4 (Checkpoint 4A): JSONL event streaming reader, structural validation, malformed record detection, stats tracking (`events_total`, `malformed_events`).
-  - Part 4 (Checkpoint 4B): Database ledger storage, safe schema migration with legacy data preservation, PII phone encryption at rest, narrow duplicate event handling, file idempotency, and atomic transactions.
-- **Current Limitations / Upcoming in Next Checkpoint (4C):**
-  - Checkpoint 4C: Lead phone linking, override call-based linking, orphan quarantine and retry, IST timestamp normalization, unknown disposition filtering.
-  - Part 5: Business metrics & 5 output reports.
-  - Part 6: CLI runner.
+Test breakdown:
+- `tests/test_db.py`: Connection, WAL mode, foreign keys, migrations (7 tests).
+- `tests/test_security.py`: Fernet encryption, HMAC hashing, key validation (10 tests).
+- `tests/test_normalizers.py`: Headers, phones, dates, decimals, enums, timestamps (10 tests).
+- `tests/test_lead_ingestion.py`: CSV parsing, rejections, duplicate merging, defaults (8 tests).
+- `tests/test_event_ingestion.py`: JSONL reading, parsing, duplicate suppression, ledger storage (17 tests).
+- `tests/test_event_linking.py`: Lead linking, orphan resolution, out-of-order drops, override linking (7 tests).
+- `tests/test_outcomes.py`: Call metrics, effective disposition, bucket priority order (9 tests).
+- `tests/test_reports.py`: Output file generation, headers, masking, formatting (2 tests).
+- `tests/test_cli_integration.py`: End-to-end CLI execution, idempotency, multi-drop resolution (3 tests).
