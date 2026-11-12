@@ -79,3 +79,31 @@ If your submission clears the bar, we'll schedule a **45-minute technical conver
 | Ownership | You made decisions instead of waiting to be told |
 
 Good luck. We're looking forward to reading your work.
+
+---
+
+## Assignment A: Implementation Progress & Security Architecture
+
+### Current Status
+- **Part 1 (Database Foundation):** Implemented clean SQLite connection management, schema initialization, and transactional safety in `solution/db.py`.
+- **Part 2 (PII Security & Encryption Foundation):** Implemented authenticated symmetric encryption and deterministic phone hashing in `solution/security.py`.
+
+### Security & Key Management
+- **Encryption:** Fernet (AES-128-CBC + HMAC-SHA256 authenticated encryption) for fields marked `"pii": true` (`customer_name`, `phone`).
+- **Deterministic Hashing:** HMAC-SHA256 with a secret key for phone numbers to enable duplicate detection and orphan matching without storing raw numbers.
+- **Environment Variables:**
+  - `PII_ENCRYPTION_KEY`: 32-byte url-safe base64 string.
+  - `PHONE_HASH_KEY`: Secure secret string for HMAC-SHA256.
+  - See `.env.example` for details. Secrets are never hardcoded or committed to version control.
+
+### Key Generation Commands
+```bash
+python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+python -c "import secrets; print(secrets.token_hex(32))"
+```
+
+### Running Tests
+```bash
+python -m unittest discover tests
+```
+
